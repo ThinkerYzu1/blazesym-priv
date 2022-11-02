@@ -668,7 +668,7 @@ pub struct SymbolizedResult {
     pub column: usize,
 }
 
-type ResolverList = Vec<((u64, u64), Box<dyn SymResolver>)>;
+type ResolverList = Vec<((u64, u64), Box<dyn SymResolver>, u64)>;
 
 struct ResolverMap {
     resolvers: ResolverList,
@@ -701,7 +701,11 @@ impl ResolverMap {
             }
             if let Ok(resolver) = ElfResolver::new(&entry.path, entry.loaded_address, cache_holder)
             {
-                resolvers.push((resolver.get_address_range(), Box::new(resolver)));
+                resolvers.push((
+                    resolver.get_address_range(),
+                    Box::new(resolver),
+                    resolvers.len() as u64,
+                ));
             } else {
                 #[cfg(debug_assertions)]
                 eprintln!("Fail to create ElfResolver for {}", entry.path.display());
@@ -723,7 +727,11 @@ impl ResolverMap {
                     base_address,
                 } => {
                     let resolver = ElfResolver::new(file_name, *base_address, cache_holder)?;
-                    resolvers.push((resolver.get_address_range(), Box::new(resolver)));
+                    resolvers.push((
+                        resolver.get_address_range(),
+                        Box::new(resolver),
+                        resolvers.len() as u64,
+                    ));
                 }
                 SymbolSrcCfg::Kernel {
                     kallsyms,
@@ -753,7 +761,11 @@ impl ResolverMap {
                     };
                     if let Ok(resolver) = KernelResolver::new(kallsyms, &kernel_image, cache_holder)
                     {
-                        resolvers.push((resolver.get_address_range(), Box::new(resolver)));
+                        resolvers.push((
+                            resolver.get_address_range(),
+                            Box::new(resolver),
+                            resolvers.len() as u64,
+                        ));
                     } else {
                         #[cfg(debug_assertions)]
                         eprintln!("fail to load the kernel image {}", kernel_image.display());
@@ -774,32 +786,51 @@ impl ResolverMap {
                     base_address,
                 } => {
                     let resolver = GsymResolver::new(file_name.clone(), *base_address)?;
-                    resolvers.push((resolver.get_address_range(), Box::new(resolver)));
+                    resolvers.push((
+                        resolver.get_address_range(),
+                        Box::new(resolver),
+                        resolvers.len() as u64,
+                    ));
                 }
             };
         }
-        resolvers.sort_by_key(|x| x.0 .0); // sorted by the loaded addresses
+        resolvers.sort_by_key(|x| (x.0 .0 as u128) << 16 | x.2 as u128); // sorted by the loaded addresses and the order
 
         Ok(ResolverMap { resolvers })
     }
 
-    pub fn find_resolver(&self, address: u64) -> Option<&dyn SymResolver> {
-        let idx =
-            tools::search_address_key(&self.resolvers, address, &|map: &(
-                (u64, u64),
-                Box<dyn SymResolver>,
-            )|
-             -> u64 { map.0 .0 })?;
-        let (loaded_begin, loaded_end) = self.resolvers[idx].0;
-        if loaded_begin != loaded_end && address >= loaded_end {
-            // `begin == end` means this ELF file may have only
-            // symbols and debug information.  For this case, we
-            // always use this resolver if the given address is just
-            // above its loaded address.
-            None
+    pub fn find_resolvers(&self, address: u64) -> Vec<&dyn SymResolver> {
+        let mut idx = if let Some(idx) = tools::search_address_key(
+            &self.resolvers,
+            address,
+            &|map: &((u64, u64), Box<dyn SymResolver>, u64)| -> u64 { map.0 .0 },
+        ) {
+            idx
         } else {
-            Some(self.resolvers[idx].1.as_ref())
+            return vec![];
+        };
+        // There may have more than one matched resolver.
+        // Try to find the first matched resolver.
+        while idx > 0 {
+            let prev = idx - 1;
+            let (begin, end) = self.resolvers[prev].0;
+            if address < begin || address >= end {
+                break;
+            }
+            idx -= 1;
         }
+
+        let mut found = vec![];
+        for i in idx..self.resolvers.len() {
+            let (loaded_begin, loaded_end) = self.resolvers[i].0;
+            if loaded_begin != loaded_end && address >= loaded_end {
+                // Not matched one
+                break;
+            } else {
+                found.push(self.resolvers[i].1.as_ref());
+            }
+        }
+        found
     }
 }
 
@@ -915,7 +946,7 @@ impl BlazeSymbolizer {
     ) -> Option<Vec<SymbolInfo>> {
         let resolver_map = ResolverMap::new(sym_srcs, &self.cache_holder).ok()?;
         let mut found = vec![];
-        for (_, resolver) in resolver_map.resolvers {
+        for (_, resolver, _order) in resolver_map.resolvers {
             if let Some(mut syms) = resolver.find_address(name, opts) {
                 for sym in &mut syms {
                     if opts.offset_in_file {
@@ -936,8 +967,13 @@ impl BlazeSymbolizer {
     #[allow(dead_code)]
     fn find_line_info(&self, sym_srcs: &[SymbolSrcCfg], addr: u64) -> Option<AddressLineInfo> {
         let resolver_map = ResolverMap::new(sym_srcs, &self.cache_holder).ok()?;
-        let resolver = resolver_map.find_resolver(addr)?;
-        resolver.find_line_info(addr)
+        for resolver in resolver_map.find_resolvers(addr) {
+            let r = resolver.find_line_info(addr);
+            if r.is_some() {
+                return r;
+            }
+        }
+        None
     }
 
     fn find_addr_features_context(features: Vec<FindAddrFeature>) -> FindAddrOpts {
@@ -992,7 +1028,7 @@ impl BlazeSymbolizer {
             }
         };
         let mut syms = vec![];
-        for (_, resolver) in &resolver_map.resolvers {
+        for (_, resolver, _order) in &resolver_map.resolvers {
             for mut sym in resolver
                 .find_address_regex(pattern, &ctx)
                 .unwrap_or_default()
@@ -1057,7 +1093,7 @@ impl BlazeSymbolizer {
         let mut syms_list = vec![];
         for name in names {
             let mut found = vec![];
-            for (_, resolver) in &resolver_map.resolvers {
+            for (_, resolver, _order) in &resolver_map.resolvers {
                 if let Some(mut syms) = resolver.find_address(name, &ctx) {
                     for sym in &mut syms {
                         if ctx.offset_in_file {
@@ -1119,36 +1155,30 @@ impl BlazeSymbolizer {
         let info: Vec<Vec<SymbolizedResult>> = addresses
             .iter()
             .map(|addr| {
-                let resolver = if let Some(resolver) = resolver_map.find_resolver(*addr) {
-                    resolver
-                } else {
-                    return vec![];
-                };
-
-                let res_syms = resolver.find_symbols(*addr);
-                let linfo = if self.line_number_info {
-                    resolver.find_line_info(*addr)
-                } else {
-                    None
-                };
-                if res_syms.is_empty() {
-                    if let Some(linfo) = linfo {
-                        vec![SymbolizedResult {
-                            symbol: "".to_string(),
-                            start_address: 0,
-                            path: linfo.path,
-                            line_no: linfo.line_no,
-                            column: linfo.column,
-                        }]
+                let mut found = vec![];
+                for resolver in resolver_map.find_resolvers(*addr) {
+                    let res_syms = resolver.find_symbols(*addr);
+                    let linfo = if self.line_number_info {
+                        resolver.find_line_info(*addr)
                     } else {
-                        vec![]
+                        None
+                    };
+                    if res_syms.is_empty() {
+                        if let Some(linfo) = linfo {
+                            found.push(SymbolizedResult {
+                                symbol: "".to_string(),
+                                start_address: 0,
+                                path: linfo.path,
+                                line_no: linfo.line_no,
+                                column: linfo.column,
+                            });
+                        }
+                        continue;
                     }
-                } else {
-                    let mut results = vec![];
                     for sym in res_syms {
                         if let Some(ref linfo) = linfo {
                             let (sym, start) = sym;
-                            results.push(SymbolizedResult {
+                            found.push(SymbolizedResult {
                                 symbol: String::from(sym),
                                 start_address: start,
                                 path: linfo.path.clone(),
@@ -1157,7 +1187,7 @@ impl BlazeSymbolizer {
                             });
                         } else {
                             let (sym, start) = sym;
-                            results.push(SymbolizedResult {
+                            found.push(SymbolizedResult {
                                 symbol: String::from(sym),
                                 start_address: start,
                                 path: "".to_string(),
@@ -1166,8 +1196,8 @@ impl BlazeSymbolizer {
                             });
                         }
                     }
-                    results
                 }
+                found
             })
             .collect();
         info

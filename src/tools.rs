@@ -257,7 +257,6 @@ pub fn decode_udword(data: &[u8]) -> u64 {
     decode_uword(data) as u64 | ((decode_uword(&data[4..]) as u64) << 32)
 }
 
-#[allow(dead_code)]
 #[inline(always)]
 pub fn decode_swdord(data: &[u8]) -> i64 {
     let udw = decode_udword(data);
