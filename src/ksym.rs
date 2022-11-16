@@ -1,4 +1,4 @@
-use super::{FindAddrOpts, SymbolInfo, SymbolType};
+use super::{FindAddrOpts, InlineFunc, SymbolInfo, SymbolType};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -193,6 +193,10 @@ impl SymResolver for KSymResolver {
 
     fn get_obj_file_name(&self) -> &Path {
         &self.file_name
+    }
+
+    fn find_inline_functions(&self, _addr: u64) -> Option<Vec<InlineFunc>> {
+        None
     }
 
     fn repr(&self) -> String {

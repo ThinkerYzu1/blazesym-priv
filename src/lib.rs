@@ -137,6 +137,13 @@ impl Default for SymbolInfo {
     }
 }
 
+/// Information of a inlined function.
+pub struct InlineFunc {
+    pub name: String,
+    pub file_name: String,
+    pub line_no: usize,
+}
+
 /// The trait of symbol resolvers.
 ///
 /// An symbol resolver usually provides information from one symbol
@@ -158,6 +165,11 @@ trait SymResolver {
     fn addr_file_off(&self, addr: u64) -> Option<u64>;
     /// Get the file name of the shared object.
     fn get_obj_file_name(&self) -> &Path;
+    /// Find functions inlined at the give address.
+    ///
+    /// Return a list of inlined functions from the most outer
+    /// function to the most inner function.
+    fn find_inline_functions(&self, addr: u64) -> Option<Vec<InlineFunc>>;
 
     fn repr(&self) -> String;
 }
@@ -489,6 +501,10 @@ impl SymResolver for ElfResolver {
         &self.file_name
     }
 
+    fn find_inline_functions(&self, _addr: u64) -> Option<Vec<InlineFunc>> {
+        None
+    }
+
     fn repr(&self) -> String {
         match self.backend {
             ElfBackend::Dwarf(_) => format!("DWARF {}", self.file_name.display()),
@@ -562,6 +578,10 @@ impl SymResolver for KernelResolver {
 
     fn get_obj_file_name(&self) -> &Path {
         &self.kernel_image
+    }
+
+    fn find_inline_functions(&self, _addr: u64) -> Option<Vec<InlineFunc>> {
+        None
     }
 
     fn repr(&self) -> String {
@@ -1201,6 +1221,42 @@ impl BlazeSymbolizer {
             })
             .collect();
         info
+    }
+
+    /// Find inlined functions at at a list of addresses.
+    ///
+    /// For each address in the list, this function returns a vector
+    /// of inlined functions if there is.  For the addresses that has
+    /// no inlined function, this function returns an empty vector.
+    pub fn find_inline(
+        &self,
+        sym_srcs: &[SymbolSrcCfg],
+        addresses: &[u64],
+    ) -> Vec<Vec<InlineFunc>> {
+        let resolver_map = if let Ok(map) = ResolverMap::new(sym_srcs, &self.cache_holder) {
+            map
+        } else {
+            #[cfg(debug_assertions)]
+            eprintln!("Fail to build ResolverMap");
+            return vec![];
+        };
+
+        let result: Vec<Vec<InlineFunc>> = addresses
+            .iter()
+            .map(|addr| {
+                for resolver in resolver_map.find_resolvers(*addr) {
+                    if let Some(stk) = resolver.find_inline_functions(*addr) {
+                        if stk.is_empty() {
+                            continue;
+                        }
+                        return stk;
+                    }
+                }
+                vec![]
+            })
+            .collect();
+
+        result
     }
 }
 
@@ -2111,6 +2167,138 @@ pub unsafe extern "C" fn blazesym_syms_list_free(syms_list: *const *const blazes
     dealloc(raw_buf_with_sz, Layout::from_size_align(sz, 8).unwrap());
 }
 
+#[repr(C)]
+pub struct blazesym_inline_func {
+    name: *const u8,
+    file_name: *const u8,
+    line_no: usize,
+}
+
+unsafe fn convert_inline_to_c(
+    inline_stk_lst: Vec<Vec<InlineFunc>>,
+) -> *const *const blazesym_inline_func {
+    let if_reserve = inline_stk_lst.iter().map(|x| x.len() + 1).sum();
+    let str_reserve: usize = inline_stk_lst
+        .iter()
+        .map(|stk| {
+            stk.iter()
+                .map(|inline| inline.name.len() + inline.file_name.len() + 2)
+                .sum::<usize>()
+        })
+        .sum();
+    let stk_lst_bytes = inline_stk_lst.len() * mem::size_of::<*const blazesym_inline_func>();
+    let if_bytes = if_reserve * mem::size_of::<blazesym_inline_func>();
+    let strs_bytes = str_reserve;
+
+    let buf_size = stk_lst_bytes + if_bytes + strs_bytes;
+    let raw_buf =
+        alloc(Layout::from_size_align(buf_size as usize + mem::size_of::<u64>(), 8).unwrap());
+
+    // Store the size of the buffer before the returned address.
+    *(raw_buf as *mut u64) = buf_size as u64;
+
+    let mut stk_ptr = raw_buf.add(mem::size_of::<u64>()) as *mut *const blazesym_inline_func;
+    let stk_lst = stk_ptr;
+    let mut if_ptr = stk_ptr.add(inline_stk_lst.len()) as *mut blazesym_inline_func;
+    let mut str_ptr = if_ptr.add(if_reserve) as *mut u8;
+
+    for stk in inline_stk_lst {
+        // Set the pointer to the stack of inlined functions for an address.
+        *stk_ptr = if_ptr;
+        stk_ptr = stk_ptr.add(1);
+
+        // Fill blazesym_inline_funcs for an address.
+        for inline in stk {
+            (*if_ptr).name = str_ptr;
+            ptr::copy_nonoverlapping(inline.name.as_ptr(), str_ptr, inline.name.len());
+            str_ptr = str_ptr.add(inline.name.len());
+            *str_ptr = 0;
+            str_ptr = str_ptr.add(1);
+
+            (*if_ptr).file_name = str_ptr;
+            ptr::copy_nonoverlapping(inline.file_name.as_ptr(), str_ptr, inline.file_name.len());
+            str_ptr = str_ptr.add(inline.file_name.len());
+            *str_ptr = 0;
+            str_ptr = str_ptr.add(1);
+
+            (*if_ptr).line_no = inline.line_no;
+
+            if_ptr = if_ptr.add(1);
+        }
+
+        // A stack is ended by a blazesym_inline_func that its name is
+        // null.
+        (*if_ptr).name = ptr::null();
+        (*if_ptr).file_name = ptr::null();
+        (*if_ptr).line_no = 0;
+        if_ptr = if_ptr.add(1);
+    }
+
+    stk_lst
+}
+
+/// Find the information of inline functions at addresses.
+///
+/// Returns a list of inline function ([`blazesym_inline_func`])
+/// stack.  Every address has their inline function stack, which is a
+/// list of inlined functions.  The returned pointer is an array of
+/// pointers to the stacks.  A stack is an array of
+/// blazesym_inline_func, and it is always ended by a
+/// blazesym_inline_func that its `name` is null.
+///
+/// # Safety
+///
+/// The returned pointer should be freed by [`blazesym_inline_free()`].
+#[no_mangle]
+pub unsafe extern "C" fn blazesym_find_inline(
+    symbolizer: *mut blazesym,
+    sym_srcs: *const sym_src_cfg,
+    sym_srcs_len: u32,
+    addrs: *const u64,
+    addr_cnt: usize,
+) -> *const *const blazesym_inline_func {
+    let sym_srcs_rs = if let Some(sym_srcs_rs) = symbolsrccfg_to_rust(sym_srcs, sym_srcs_len) {
+        sym_srcs_rs
+    } else {
+        #[cfg(debug_assertions)]
+        eprintln!("Fail to transform configurations of symbolizer from C to Rust");
+        return ptr::null_mut();
+    };
+
+    let symbolizer = &*(*symbolizer).symbolizer;
+    let addresses = Vec::from_raw_parts(addrs as *mut u64, addr_cnt, addr_cnt);
+
+    let results = symbolizer.find_inline(&sym_srcs_rs, &addresses);
+
+    addresses.leak();
+
+    if results.is_empty() {
+        #[cfg(debug_assertions)]
+        eprintln!("Empty result while request for {}", addr_cnt);
+        return ptr::null();
+    }
+
+    convert_inline_to_c(results)
+}
+
+/// Free the memory returned by [`blazesym_find_inline()`].
+///
+/// # Safety
+///
+/// `inline_stk_list` should be the pointer returned by [`blazesym_find_inline()`].
+#[no_mangle]
+pub unsafe extern "C" fn blazesym_inline_free(inline_stk_list: *const *const blazesym_inline_func) {
+    if inline_stk_list.is_null() {
+        #[cfg(debug_assertions)]
+        eprintln!("blazesym_inline_free(null)");
+        return;
+    }
+
+    let raw_buf_with_sz = (inline_stk_list as *mut u8).offset(-(mem::size_of::<u64>() as isize));
+    let sz = *(raw_buf_with_sz as *mut u64) as usize + mem::size_of::<u64>();
+    dealloc(raw_buf_with_sz, Layout::from_size_align(sz, 8).unwrap());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2245,5 +2433,43 @@ mod tests {
             }
         }
         assert_eq!(cnt, 1);
+    }
+
+    #[test]
+    fn gsym_find_inline() {
+        let args: Vec<String> = env::args().collect();
+        let bin_name = &args[0];
+        let test_gsym = Path::new(bin_name)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("data")
+            .join("test.gsym");
+        let base: u64 = 0x77a7000; // pickup randomly.
+        let features = vec![SymbolizerFeature::LineNumberInfo(true)];
+        let srcs = vec![SymbolSrcCfg::Gsym {
+            file_name: test_gsym,
+            base_address: base,
+        }];
+        let symbolizer = BlazeSymbolizer::new_opt(&features).unwrap();
+        let tgt_addr = 0x0000000002000001;
+        let inline_stk_lst = symbolizer.find_inline(&srcs, &[tgt_addr + base]);
+        assert_eq!(inline_stk_lst.len(), 1);
+        assert_eq!(inline_stk_lst[0].len(), 2);
+
+        let mut stk = inline_stk_lst[0].iter();
+
+        let inline = stk.next().unwrap();
+        assert_eq!(inline.name, "main");
+
+        let inline = stk.next().unwrap();
+        assert_eq!(inline.name, "factorial_inline_wrapper");
+
+        assert_eq!(inline.line_no, 56);
     }
 }
