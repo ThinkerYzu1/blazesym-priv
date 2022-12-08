@@ -36,11 +36,11 @@ sources, and line numbers of addresses involved in a process.
 
 
 ```ignore
-	use blazesym::{BlazeSymbolizer, SymSrcCfg, SymbolizedResult};
+	use blazesym::{BlazeSymbolizer, SymbolSrcCfg, SymbolizedResult};
 
 	let process_id: u32 = <process id>;
 	// load all symbols of loaded files of the given process.
-	let sym_srcs = [SymSrcCfg::Process { pid: process_id }];
+	let sym_srcs = [SymbolSrcCfg::Process { pid: process_id }];
 	let symbolizer = BlazeSymbolizer::new().unwrap();
 
 	let stack: [u64] = [0xff023, 0x17ff93b];			// Addresses of instructions
@@ -71,11 +71,11 @@ sources, and line numbers of addresses involved in a process.
 ```
 
 `sym_srcs` is a list of symbol sources in a process.
-However, there is only one `SymSrcCfg::Process {}` here.
-`SymSrcCfg::Process {}` is a convenient variant for loading all objects,
+However, there is only one `SymbolSrcCfg::Process {}` here.
+`SymbolSrcCfg::Process {}` is a convenient variant for loading all objects,
 i.e., binaries and shared libraries, mapped in a process.  Therefore, developers
 do not have to specify each object and its base address with
-`SymSrcCfg::Process {}`.
+`SymbolSrcCfg::Process {}`.
 
 `symlist` is a list of lists of `SymbolizedResult`.  The instruction provided
 at an address can result from several lines of code from multiple
@@ -86,10 +86,10 @@ argument passed to [`BlazeSymbolizer::symbolize()`].
 
 ### With Linux Kernel
 
-`SymSrcCfg::Kernel {}` is a variant to load symbols of the Linux Kernel.
+`SymbolSrcCfg::Kernel {}` is a variant to load symbols of the Linux Kernel.
 
 ```ignore
-	let sym_srcs = [SymSrcCfg::Kernel {
+	let sym_srcs = [SymbolSrcCfg::Kernel {
 		kallsyms: Some("/proc/kallsyms".to_string()),
 		kernel_image: Some("/boot/vmlinux-xxxxx".to_string()),
 	}];
@@ -105,7 +105,7 @@ kallsyms and find the kernel image of the running kernel from several
 potential directories; for instance, `"/boot/"` and `"/usr/lib/debug/boot/"`.
 
 ```ignore
-	let sym_srcs = [SymSrcCfg::Kernel { kallsyms: None, kernel_image: None }];
+	let sym_srcs = [SymbolSrcCfg::Kernel { kallsyms: None, kernel_image: None }];
 ```
 
 ### A list of ELF files
@@ -113,9 +113,9 @@ potential directories; for instance, `"/boot/"` and `"/usr/lib/debug/boot/"`.
 You can still provide a list of ELF files and their base addresses if necessary.
 
 ```ignore
-	let sym_srcs = [SymSrcCfg::Elf { file_name: String::from("/lib/libc.so.xxx"),
+	let sym_srcs = [SymbolSrcCfg::Elf { file_name: String::from("/lib/libc.so.xxx"),
 	                                 base_address: 0x1f005d },
-	                SymSrcCfg::Elf { fie_name: String::from("/path/to/my/binary"),
+	                SymbolSrcCfg::Elf { fie_name: String::from("/path/to/my/binary"),
 				                     base_address: 0x77777 },
 	                ......
 	];
