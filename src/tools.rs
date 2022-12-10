@@ -256,3 +256,196 @@ pub fn decode_sword(data: &[u8]) -> i32 {
 pub fn decode_udword(data: &[u8]) -> u64 {
     decode_uword(data) as u64 | ((decode_uword(&data[4..]) as u64) << 32)
 }
+
+#[allow(dead_code)]
+#[inline(always)]
+pub fn decode_swdord(data: &[u8]) -> i64 {
+    let udw = decode_udword(data);
+    if udw >= 0x8000000000000000 {
+        ((udw as i128) - 0x10000000000000000) as i64
+    } else {
+        udw as i64
+    }
+}
+
+/// Parse basic types from a raw buffer (&[u8]).
+///
+/// Provide functions to parser values of basic types from the buffer
+/// sequentially.
+pub struct RawBufReader<'a> {
+    off: usize,
+    data: &'a [u8],
+}
+
+impl<'a> RawBufReader<'a> {
+    pub fn new(data: &[u8]) -> RawBufReader {
+        RawBufReader { off: 0, data }
+    }
+
+    #[inline]
+    fn ensure(&self, len: usize) -> Option<()> {
+        if self.data.len() < (self.off + len) {
+            return None;
+        }
+        Some(())
+    }
+
+    #[inline]
+    pub fn pos(&self) -> usize {
+        self.off
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.off >= self.data.len()
+    }
+
+    #[inline]
+    pub fn take(&mut self) -> u8 {
+        let b = self.data[self.off];
+        self.off += 1;
+        b
+    }
+
+    #[inline]
+    pub fn peek(&mut self) -> u8 {
+        self.data[self.off]
+    }
+
+    #[inline]
+    pub fn take_slice(&mut self, len: usize) -> Option<&[u8]> {
+        self.ensure(len)?;
+        let s = &self.data[self.off..(self.off + len)];
+        self.off += len;
+        Some(s)
+    }
+
+    #[inline]
+    pub fn decode_leb128_128(&mut self) -> Option<u128> {
+        let mut sz = 0;
+        let mut v: u128 = 0;
+        for c in &self.data[self.off..] {
+            v |= ((c & 0x7f) as u128) << sz;
+            sz += 7;
+            if (c & 0x80) == 0 {
+                self.off += sz / 7;
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    #[inline]
+    pub fn decode_leb128(&mut self) -> Option<u64> {
+        self.decode_leb128_128().map(|v| v as u64)
+    }
+
+    pub fn decode_leb128_128_s(&mut self) -> Option<i128> {
+        let saved_off = self.off;
+        if let Some(v) = self.decode_leb128_128() {
+            let s = self.off - saved_off;
+            let s_mask: u128 = 1 << (s * 7 - 1);
+            return if (v & s_mask) != 0 {
+                // negative
+                Some((v as i128) - (s_mask << 1) as i128)
+            } else {
+                Some(v as i128)
+            };
+        }
+        None
+    }
+
+    #[inline]
+    pub fn decode_leb128_s(&mut self) -> Option<i64> {
+        self.decode_leb128_128_s()?.try_into().ok()
+    }
+
+    #[inline]
+    pub fn decode_uhalf(&mut self) -> Option<u16> {
+        self.ensure(2)?;
+        let data = &self.data[self.off..];
+        self.off += 2;
+        Some(u16::from_le_bytes(
+            data[..2].try_into().expect("slice with incorrect length"),
+        ))
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub fn decode_shalf(&mut self) -> Option<i16> {
+        self.ensure(2)?;
+        let data = &self.data[self.off..];
+        self.off += 2;
+        Some(i16::from_le_bytes(
+            data[..2].try_into().expect("slice with incorrect length"),
+        ))
+    }
+
+    #[inline]
+    pub fn decode_uword(&mut self) -> Option<u32> {
+        self.ensure(4)?;
+        let data = &self.data[self.off..];
+        self.off += 4;
+        Some(u32::from_le_bytes(
+            data[..4].try_into().expect("slice with incorrect length"),
+        ))
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub fn decode_sword(&mut self) -> Option<i32> {
+        self.ensure(4)?;
+        let data = &self.data[self.off..];
+        self.off += 4;
+        Some(i32::from_le_bytes(
+            data[..4].try_into().expect("slice with incorrect length"),
+        ))
+    }
+
+    #[inline]
+    pub fn decode_udword(&mut self) -> Option<u64> {
+        self.ensure(8)?;
+        let data = &self.data[self.off..];
+        self.off += 8;
+        Some(u64::from_le_bytes(
+            data[..8].try_into().expect("slice with incorrect length"),
+        ))
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn decode_sdword(&mut self) -> Option<i64> {
+        self.ensure(8)?;
+        let data = &self.data[self.off..];
+        self.off += 8;
+        Some(i64::from_le_bytes(
+            data[..8].try_into().expect("slice with incorrect length"),
+        ))
+    }
+
+    pub fn extract_string(&mut self) -> Option<&str> {
+        let off = self.off;
+        let data = self.data;
+        let mut end = off;
+
+        if off >= data.len() {
+            return None;
+        }
+        while end < data.len() && data[end] != 0 {
+            end += 1;
+        }
+        if end >= data.len() {
+            return None;
+        }
+        self.off = end + 1;
+        CStr::from_bytes_with_nul(&data[off..=end])
+            .ok()?
+            .to_str()
+            .ok()
+    }
+}
